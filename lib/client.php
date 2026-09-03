@@ -2,26 +2,59 @@
 
 require_once __DIR__ . '/bootstrap.php';
 
-// #region debug-point helper:plugin-ticket-timeout
-function plugin_station_debug_report(string $hypothesisId, string $location, string $msg, array $data = [], string $runId = 'post-fix'): void
+function plugin_station_starts_with(string $haystack, string $needle): bool
 {
-    $envPath = dirname(__DIR__) . '/.dbg/plugin-ticket-timeout.env';
+    if ($needle === '') {
+        return true;
+    }
+
+    return strpos($haystack, $needle) === 0;
+}
+
+function plugin_station_debug_config(): ?array
+{
+    static $config = null;
+    static $loaded = false;
+    if ($loaded) {
+        return $config;
+    }
+
+    $loaded = true;
+    $envPath = dirname(__DIR__) . '/.dbg/plugin-debug.env';
+    if (!is_file($envPath)) {
+        $config = null;
+        return null;
+    }
+
     $debugUrl = 'http://127.0.0.1:7778/event';
-    $sessionId = 'plugin-ticket-timeout';
-    if (is_file($envPath)) {
-        $content = @file_get_contents($envPath);
-        if (is_string($content) && $content !== '') {
-            foreach (preg_split('/\r?\n/', $content) as $line) {
-                if (str_starts_with($line, 'DEBUG_SERVER_URL=')) {
-                    $debugUrl = trim(substr($line, strlen('DEBUG_SERVER_URL=')));
-                } elseif (str_starts_with($line, 'DEBUG_SESSION_ID=')) {
-                    $sessionId = trim(substr($line, strlen('DEBUG_SESSION_ID=')));
-                }
+    $sessionId = 'plugin-debug';
+    $content = @file_get_contents($envPath);
+    if (is_string($content) && $content !== '') {
+        foreach (preg_split('/\r?\n/', $content) as $line) {
+            if (plugin_station_starts_with($line, 'DEBUG_SERVER_URL=')) {
+                $debugUrl = trim(substr($line, strlen('DEBUG_SERVER_URL=')));
+            } elseif (plugin_station_starts_with($line, 'DEBUG_SESSION_ID=')) {
+                $sessionId = trim(substr($line, strlen('DEBUG_SESSION_ID=')));
             }
         }
     }
+
+    $config = [
+        'debug_url' => $debugUrl,
+        'session_id' => $sessionId,
+    ];
+    return $config;
+}
+
+// #region debug-point helper:plugin-debug
+function plugin_station_debug_report(string $hypothesisId, string $location, string $msg, array $data = [], string $runId = 'post-fix'): void
+{
+    $debugConfig = plugin_station_debug_config();
+    if ($debugConfig === null) {
+        return;
+    }
     $payload = json_encode([
-        'sessionId' => $sessionId,
+        'sessionId' => $debugConfig['session_id'],
         'runId' => $runId,
         'hypothesisId' => $hypothesisId,
         'location' => $location,
@@ -32,7 +65,7 @@ function plugin_station_debug_report(string $hypothesisId, string $location, str
     if ($payload === false) {
         return;
     }
-    @file_get_contents($debugUrl, false, stream_context_create([
+    @file_get_contents($debugConfig['debug_url'], false, stream_context_create([
         'http' => [
             'method' => 'POST',
             'header' => "Content-Type: application/json\r\nConnection: close\r\n",
@@ -68,12 +101,29 @@ function plugin_station_normalize_get_signature_payload(array $payload): array
     return is_array($normalized) ? $normalized : [];
 }
 
+function plugin_station_gateway_max_attempts(): int
+{
+    return 2;
+}
+
+function plugin_station_gateway_connect_timeout_seconds(): int
+{
+    return 3;
+}
+
+function plugin_station_gateway_timeout_seconds(): int
+{
+    return 20;
+}
+
 function plugin_station_gateway_request(string $method, string $path, array $payload = []): array
 {
     $config = plugin_station_config();
     $url = rtrim($config['gateway_base_url'], '/') . $path;
     $attempt = 0;
-    $maxAttempts = 3;
+    $maxAttempts = plugin_station_gateway_max_attempts();
+    $connectTimeout = plugin_station_gateway_connect_timeout_seconds();
+    $timeout = plugin_station_gateway_timeout_seconds();
     $lastError = [
         'success' => false,
         'code' => 500,
@@ -90,16 +140,19 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
             : $payload;
         $signature = plugin_station_build_signature($signaturePayload, $timestamp, $nonce, $config['app_secret']);
         $ch = curl_init();
-        $shouldDebug = str_starts_with($path, '/open/plugin/tickets');
+        $shouldDebug = plugin_station_debug_config() !== null
+            && (plugin_station_starts_with($path, '/open/plugin/tickets')
+                || plugin_station_starts_with($path, '/open/plugin/orders'));
 
         if ($shouldDebug) {
             // #region debug-point B:gateway-request-start
-            plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:start', '[DEBUG] plugin ticket gateway request start', [
+            plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:start', '[DEBUG] plugin gateway request start', [
                 'path' => $path,
                 'method' => strtoupper($method),
                 'attempt' => $attempt,
                 'site_id' => (string)($payload['site_id'] ?? ''),
                 'ticket_id' => (string)($payload['ticket_id'] ?? ''),
+                'trace_id' => (string)($payload['trace_id'] ?? ''),
                 'current_user_uid' => (int)($payload['current_user_uid'] ?? 0),
             ]);
             // #endregion
@@ -115,8 +168,8 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
             curl_setopt_array($ch, [
                 CURLOPT_URL => $url . '?' . $query,
                 CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_CONNECTTIMEOUT => 5,
-                CURLOPT_TIMEOUT => 60,
+                CURLOPT_CONNECTTIMEOUT => $connectTimeout,
+                CURLOPT_TIMEOUT => $timeout,
                 CURLOPT_ENCODING => '',
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_0,
                 CURLOPT_NOSIGNAL => true,
@@ -142,8 +195,8 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
                 'Connection: close',
                 ],
                 CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_CONNECTTIMEOUT => 5,
-                CURLOPT_TIMEOUT => 60,
+                CURLOPT_CONNECTTIMEOUT => $connectTimeout,
+                CURLOPT_TIMEOUT => $timeout,
                 CURLOPT_ENCODING => '',
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_0,
                 CURLOPT_NOSIGNAL => true,
@@ -160,7 +213,7 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
 
         if ($shouldDebug) {
             // #region debug-point B:gateway-request-finished
-            plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:finish', '[DEBUG] plugin ticket gateway request finish', [
+            plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:finish', '[DEBUG] plugin gateway request finish', [
                 'path' => $path,
                 'method' => strtoupper($method),
                 'attempt' => $attempt,
@@ -174,6 +227,17 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
         }
 
         if ($errno !== 0) {
+            if ($shouldDebug) {
+                // #region debug-point B:gateway-request-curl-error
+                plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:curl-error', '[DEBUG] plugin gateway request curl error', [
+                    'path' => $path,
+                    'method' => strtoupper($method),
+                    'attempt' => $attempt,
+                    'curl_errno' => $errno,
+                    'curl_error' => $error,
+                ], 'pre-fix');
+                // #endregion
+            }
             $lastError = [
                 'success' => false,
                 'code' => 500,
@@ -188,6 +252,17 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
 
         $decoded = json_decode((string) $raw, true);
         if (!is_array($decoded)) {
+            if ($shouldDebug) {
+                // #region debug-point B:gateway-request-invalid-json
+                plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:invalid-json', '[DEBUG] plugin gateway request invalid json', [
+                    'path' => $path,
+                    'method' => strtoupper($method),
+                    'attempt' => $attempt,
+                    'status_code' => $statusCode,
+                    'raw_prefix' => is_string($raw) ? substr($raw, 0, 300) : '',
+                ], 'pre-fix');
+                // #endregion
+            }
             $lastError = [
                 'success' => false,
                 'code' => 500,
@@ -199,6 +274,22 @@ function plugin_station_gateway_request(string $method, string $path, array $pay
                 continue;
             }
             return $lastError;
+        }
+
+        if ($shouldDebug) {
+            // #region debug-point B:gateway-request-decoded
+            plugin_station_debug_report('B', 'plugin-station/lib/client.php:plugin_station_gateway_request:decoded', '[DEBUG] plugin gateway request decoded response', [
+                'path' => $path,
+                'method' => strtoupper($method),
+                'attempt' => $attempt,
+                'status_code' => $statusCode,
+                'success' => (bool)($decoded['success'] ?? false),
+                'code' => (int)($decoded['code'] ?? 0),
+                'message' => (string)($decoded['message'] ?? ''),
+                'data_type' => gettype($decoded['data'] ?? null),
+                'data_count' => is_array($decoded['data'] ?? null) ? count($decoded['data']) : -1,
+            ], 'pre-fix');
+            // #endregion
         }
 
         if ($statusCode >= 500 && $attempt < $maxAttempts) {

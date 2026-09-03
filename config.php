@@ -1,28 +1,22 @@
 <?php
 
-$defaults = [
-    'plugin_name' => '二九对接站插件',
-    'gateway_base_url' => 'http://127.0.0.1:9325',
+$config = [
+    'plugin_name' => '牢大运动',
+    'gateway_base_url' => 'https://hk-orix.ld-yd.com',
     'site_id' => 'site_demo_29',
     'app_key' => 'demo_app_key_29',
     'app_secret' => 'demo_app_secret_29',
-    'site_name' => '二九网课模拟插件测试站',
+    'site_name' => '当前站点名称',
     'db_path' => __DIR__ . '/data/plugin-local.sqlite',
+
+    // 优先留空，插件会自动查找宿主站的 common.php。
+    // 只有自动查找不到时，才手动填写其中一个。
     'host_root' => '',
     'host_common_path' => '',
+
+    // 如需通过 URL 触发同步，可填写一个随机长 token。
     'cron_token' => '',
 ];
-
-$localConfig = [];
-$localConfigPath = __DIR__ . '/config.local.php';
-if (is_file($localConfigPath)) {
-    $loaded = require $localConfigPath;
-    if (is_array($loaded)) {
-        $localConfig = $loaded;
-    }
-}
-
-$config = array_merge($defaults, $localConfig);
 
 $envMap = [
     'PLUGIN_NAME' => 'plugin_name',

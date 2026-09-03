@@ -1,0 +1,41 @@
+牢大运动插件部署说明
+
+首次部署：
+1. 将整个插件目录上传到站点目录并解压。
+2. 将目录名改为实际插件目录名，例如 `laoda`。
+3. 直接修改 `laoda/config.php`：
+   - `gateway_base_url`
+   - `site_id`
+   - `app_key`
+   - `app_secret`
+4. 确保 `laoda/` 与 `laoda/data/` 可写。
+5. 浏览器访问：
+   - `/laoda/`
+   - 或 `/laoda/index/plugin.php`
+
+宿主站适配：
+1. 插件会自动向上搜索宿主站入口，查找顺序为：
+   - `confing/common.php`
+   - `common.php`
+   - `db/common.php`
+2. 如果自动搜索不到，再手动填写：
+   - `host_root`
+   - 或 `host_common_path`
+
+宿主站要求：
+1. 宿主站能提供 `$islogin`、`$userrow`、`$DB`。
+2. PHP 需支持 `curl`、`sqlite3`。
+3. 宿主站需兼容当前余额扣退逻辑。
+
+同步方式：
+1. 优先命令行执行：
+   `php laoda/cron.php`
+2. 如果只能走 URL：
+   `/laoda/api.php?action=cron_sync&cron_token=你设置的token`
+3. 通过 URL 同步时，只有 `config.php` 中设置了正确 `cron_token` 才能执行。
+
+当前特点：
+1. 前端资源已内置在插件目录。
+2. 不需要额外部署前端源码。
+3. 下单会先实时询价，再扣宿主站用户余额并写入本地 SQLite。
+4. 普通用户只能看自己的订单，`uid=1` 可查看当前站点全部本地订单。
