@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/pricing.php';
+
 function plugin_station_raw_config(): array
 {
     static $config = null;
@@ -424,6 +426,9 @@ function plugin_station_save_order(array $order): void
     ], 'pre-fix');
     // #endregion
 
+    if (!$stmt instanceof SQLite3Stmt) {
+        throw new RuntimeException('本地订单保存准备失败');
+    }
     $stmt->bindValue(':trace_id', $order['trace_id'], SQLITE3_TEXT);
     $stmt->bindValue(':site_id', $order['site_id'] ?? plugin_station_current_site_id(), SQLITE3_TEXT);
     $stmt->bindValue(':source_order_id', $order['source_order_id'] ?? '', SQLITE3_TEXT);
@@ -458,6 +463,9 @@ function plugin_station_save_order(array $order): void
     $stmt->bindValue(':created_at', $order['created_at'] ?? ($existing['created_at'] ?? plugin_station_now()), SQLITE3_TEXT);
     $stmt->bindValue(':updated_at', plugin_station_now(), SQLITE3_TEXT);
     $executeResult = $stmt->execute();
+    if (!$executeResult instanceof SQLite3Result) {
+        throw new RuntimeException('本地订单保存失败');
+    }
     // #region debug-point E:save-order-after-execute
     plugin_station_debug_report('E', 'plugin-station/lib/bootstrap.php:save-order:after-execute', '[DEBUG] plugin save order after execute', [
         'trace_id' => (string)($order['trace_id'] ?? ''),
@@ -472,7 +480,7 @@ function plugin_station_list_local_orders(?int $hostUserUid = null, ?string $sit
 {
     $db = plugin_station_db();
     $items = [];
-    $sql = 'SELECT trace_id, site_id, source_order_id, host_user_uid, host_username, host_display_name, host_user_uuid, account, password, school_name, platform, target_km, price_cents, status, status_message, host_charge_amount, host_charge_applied, refunded_cents, refund_count, refund_reason, last_refund_trade_no, refund_updated_at, main_order_status, current_km, main_target_km, status_query_updated_at, host_refund_amount, host_refund_count, created_at, updated_at FROM plugin_local_orders';
+    $sql = 'SELECT trace_id, site_id, source_order_id, host_user_uid, host_username, host_display_name, host_user_uuid, account, password, school_name, platform, target_km, price_cents, status, status_message, host_charge_amount, host_charge_applied, refunded_cents, refund_count, refund_reason, last_refund_trade_no, refund_updated_at, main_order_status, current_km, main_target_km, status_query_updated_at, host_refund_amount, host_refund_count, payload_json, created_at, updated_at FROM plugin_local_orders';
     $conditions = [];
     if ($siteId !== null && $siteId !== '') {
         $conditions[] = "(COALESCE(site_id, '') = :site_id OR COALESCE(site_id, '') = '')";
@@ -494,7 +502,7 @@ function plugin_station_list_local_orders(?int $hostUserUid = null, ?string $sit
     }
     $result = $stmt->execute();
     while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $items[] = $row;
+        $items[] = plugin_station_restore_order_pricing($row);
     }
     return $items;
 }
@@ -507,7 +515,7 @@ function plugin_station_get_local_order(string $traceId, ?string $siteId = null)
                account, password, school_name, platform, target_km, price_cents, status, status_message,
                host_charge_amount, host_charge_applied, refunded_cents, refund_count, refund_reason,
                last_refund_trade_no, refund_updated_at, main_order_status, current_km, main_target_km, status_query_updated_at,
-               host_refund_amount, host_refund_count, created_at, updated_at
+               host_refund_amount, host_refund_count, payload_json, created_at, updated_at
         FROM plugin_local_orders
         WHERE trace_id = :trace_id
     ';
@@ -521,7 +529,7 @@ function plugin_station_get_local_order(string $traceId, ?string $siteId = null)
     }
     $result = $stmt->execute();
     $row = $result->fetchArray(SQLITE3_ASSOC);
-    return $row ?: null;
+    return $row ? plugin_station_restore_order_pricing($row) : null;
 }
 
 function plugin_station_get_accessible_order(string $traceId, array $currentUser): ?array
@@ -707,7 +715,12 @@ function plugin_station_sync_recent_pending_orders(int $limit = 6): void
         if (!in_array((string)($item['status'] ?? ''), ['pending_delivery', 'pending_review'], true)) {
             continue;
         }
-        plugin_station_sync_remote_status((string)($item['trace_id'] ?? ''));
+        plugin_station_sync_remote_status((string)($item['trace_id'] ?? ''), [
+            'uid' => (int)($item['host_user_uid'] ?? 0),
+            'uuid' => (string)($item['host_user_uuid'] ?? ''),
+            'username' => (string)($item['host_username'] ?? ''),
+            'display_name' => (string)($item['host_display_name'] ?? ''),
+        ]);
         $synced++;
         if ($synced >= $limit) {
             break;
@@ -805,14 +818,12 @@ function plugin_station_apply_host_user_refund(array $order, int $refundCents, s
 
     $chargedCents = (int)round((float)($order['host_charge_amount'] ?? 0) * 100);
     $refundedHostCents = (int)round((float)($order['host_refund_amount'] ?? 0) * 100);
-    if ($chargedCents <= 0) {
-        return ['success' => false, 'message' => '当前订单扣款金额无效，不能退款'];
+    $gatewayCents = (int)($order['gateway_price_cents'] ?? $order['price_cents'] ?? 0);
+    if ($chargedCents < 0 || $gatewayCents <= 0) {
+        return ['success' => false, 'message' => '当前订单原价或扣款金额无效，不能退款'];
     }
-    if ($refundCents > $chargedCents) {
-        return ['success' => false, 'message' => '远端退款金额超过站内原扣款金额'];
-    }
-
-    $deltaCents = $refundCents - $refundedHostCents;
+    $targetRefundCents = min($chargedCents, (int)round(min($refundCents, $gatewayCents) * $chargedCents / $gatewayCents));
+    $deltaCents = $targetRefundCents - $refundedHostCents;
     if ($deltaCents <= 0) {
         return [
             'success' => true,
@@ -827,8 +838,8 @@ function plugin_station_apply_host_user_refund(array $order, int $refundCents, s
 
     $amount = plugin_station_money_from_cents($deltaCents);
     $amountSql = plugin_station_money_sql($amount);
-    $db->query("UPDATE qingka_wangke_user SET money=money+'{$amountSql}' WHERE uid='{$uid}' LIMIT 1");
-    if (method_exists($db, 'affected') && (int)$db->affected() < 1) {
+    $updated = $db->query("UPDATE qingka_wangke_user SET money=money+'{$amountSql}' WHERE uid='{$uid}' LIMIT 1");
+    if ($updated === false || (method_exists($db, 'affected') && (int)$db->affected() < 1)) {
         return ['success' => false, 'message' => '站点用户退款入账失败'];
     }
 

@@ -72,7 +72,7 @@ function plugin_station_estimate_price_cents(array $payload): array
 
         return [
             'success' => true,
-            'price_cents' => (int)round($unitPrice * $targetKm * 100),
+            'price_cents' => (int)round(round($unitPrice * $targetKm * 100) * plugin_station_order_multiplier()),
         ];
     }
 
@@ -125,7 +125,32 @@ function plugin_station_sync_remote_orders_snapshot(array $currentUser): ?array
 
 function plugin_station_merge_order_snapshot(?array $localOrder, array $remoteOrder): array
 {
+    $protectedFields = array_merge(plugin_station_pricing_snapshot_fields(), [
+        'trace_id',
+        'site_id',
+        'source_order_id',
+        'host_user_uid',
+        'host_username',
+        'host_display_name',
+        'host_user_uuid',
+        'host_charge_amount',
+        'host_charge_applied',
+        'host_refund_amount',
+        'host_refund_count',
+        'customer_refunded_cents',
+        'price_cents',
+    ]);
+    if (is_array($localOrder)) {
+        foreach ($protectedFields as $field) {
+            unset($remoteOrder[$field]);
+        }
+    }
+    unset($remoteOrder['payload_json']);
     $merged = array_merge($localOrder ?: [], $remoteOrder);
+    if (is_array($localOrder)) {
+        $merged['refunded_cents'] = max((int)($localOrder['refunded_cents'] ?? 0), (int)($merged['refunded_cents'] ?? 0));
+        $merged['refund_count'] = max((int)($localOrder['refund_count'] ?? 0), (int)($merged['refund_count'] ?? 0));
+    }
     if (!empty($localOrder['password']) && empty($merged['password'])) {
         $merged['password'] = $localOrder['password'];
     }
@@ -137,28 +162,37 @@ function plugin_station_merge_order_snapshot(?array $localOrder, array $remoteOr
 
 function plugin_station_sync_local_order_from_remote(?array $localOrder, array $remoteOrder): array
 {
-    $merged = plugin_station_merge_order_snapshot($localOrder, $remoteOrder);
-    if (!is_array($localOrder)) {
-        return $merged;
-    }
-
-    $refundCents = (int)($merged['refunded_cents'] ?? 0);
-    if ($refundCents > 0) {
-        $refundResult = plugin_station_apply_host_user_refund($merged, $refundCents, (string)($merged['refund_reason'] ?? $merged['status_message'] ?? '订单退款'));
-        if ($refundResult['success'] ?? false) {
-            $merged['host_refund_amount'] = (float)($refundResult['total_refund_amount'] ?? ($merged['host_refund_amount'] ?? 0));
-            $merged['host_refund_count'] = (int)max(
-                (int)($merged['host_refund_count'] ?? 0),
-                (int)($merged['refund_count'] ?? 0),
-                (int)($refundResult['total_refund_count'] ?? 0)
-            );
-        } else {
-            $merged['status_message'] = (string)($refundResult['message'] ?? ($merged['status_message'] ?? '退款同步失败'));
+    $traceId = (string)($localOrder['trace_id'] ?? $remoteOrder['trace_id'] ?? '');
+    $lock = plugin_station_order_sync_lock($traceId);
+    try {
+        $localOrder = plugin_station_get_local_order($traceId);
+        $merged = plugin_station_merge_order_snapshot($localOrder, $remoteOrder);
+        if (!is_array($localOrder)) {
+            return $merged;
         }
-    }
 
-    plugin_station_save_order($merged);
-    return $merged;
+        $refundCents = (int)($merged['refunded_cents'] ?? 0);
+        if ($refundCents > 0) {
+            $refundResult = plugin_station_apply_host_user_refund($merged, $refundCents, (string)($merged['refund_reason'] ?? $merged['status_message'] ?? '订单退款'));
+            if ($refundResult['success'] ?? false) {
+                $merged['host_refund_amount'] = (float)($refundResult['total_refund_amount'] ?? ($merged['host_refund_amount'] ?? 0));
+                $merged['host_refund_count'] = (int)max(
+                    (int)($merged['host_refund_count'] ?? 0),
+                    (int)($merged['refund_count'] ?? 0),
+                    (int)($refundResult['total_refund_count'] ?? 0)
+                );
+            } else {
+                $merged['status_message'] = (string)($refundResult['message'] ?? ($merged['status_message'] ?? '退款同步失败'));
+            }
+        }
+
+        $merged = plugin_station_order_customer_amounts($merged);
+        plugin_station_save_order($merged);
+        return $merged;
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
 }
 
 function plugin_station_find_visible_remote_order(string $traceId, array $currentUser): ?array
@@ -213,6 +247,11 @@ function plugin_station_issue_order_query_link(array $currentUser, string $pin):
 }
 
 switch ($action) {
+    case 'pricing_settings':
+    case 'save_pricing_settings':
+        plugin_station_handle_pricing_settings($action);
+        break;
+
     case 'bootstrap':
         if (!$siteInfo['is_logged_in']) {
             plugin_station_json([
@@ -244,9 +283,9 @@ switch ($action) {
 
     case 'schools':
         plugin_station_require_logged_in_user();
-        plugin_station_json(plugin_station_cached_gateway_meta_request('schools', '/open/plugin/meta/schools', [
+        plugin_station_json(plugin_station_apply_catalog_pricing(plugin_station_cached_gateway_meta_request('schools', '/open/plugin/meta/schools', [
             'site_id' => $config['site_id'],
-        ]));
+        ])));
         break;
 
     case 'platforms':
@@ -258,9 +297,9 @@ switch ($action) {
 
     case 'prices':
         plugin_station_require_logged_in_user();
-        plugin_station_json(plugin_station_cached_gateway_meta_request('prices', '/open/plugin/meta/prices', [
+        plugin_station_json(plugin_station_apply_catalog_pricing(plugin_station_cached_gateway_meta_request('prices', '/open/plugin/meta/prices', [
             'site_id' => $config['site_id'],
-        ]));
+        ])));
         break;
 
     case 'host_balance':
@@ -429,19 +468,38 @@ switch ($action) {
         }
         $quoteData = is_array($quoteResult['data'] ?? null) ? $quoteResult['data'] : [];
         $priceCents = (int)($quoteData['price_cents'] ?? $quoteResult['price_cents'] ?? 0);
-        $expectedPriceCents = isset($payload['expected_price_cents']) ? (int)$payload['expected_price_cents'] : null;
-        if ($expectedPriceCents !== null && $expectedPriceCents >= 0 && $expectedPriceCents !== $priceCents) {
+        try {
+            $pricing = plugin_station_price_snapshot($priceCents, plugin_station_order_multiplier(), $currentUser);
+        } catch (Throwable $e) {
+            plugin_station_json(['success' => false, 'message' => '订单计价失败，请联系管理员'], 500);
+            exit;
+        }
+        $saleCents = $pricing['host_price_cents'];
+        $chargeCents = $pricing['host_charge_cents'];
+        $expectedPriceCents = null;
+        if (array_key_exists('expected_price_cents', $payload)) {
+            $expected = $payload['expected_price_cents'];
+            if ((!is_int($expected) && !is_string($expected))
+                || !preg_match('/^(0|[1-9]\d*)$/D', (string)$expected)
+                || filter_var($expected, FILTER_VALIDATE_INT) === false
+            ) {
+                plugin_station_json(['success' => false, 'message' => 'expected_price_cents 必须为非负整数分'], 400);
+            }
+            $expectedPriceCents = (int)$expected;
+        }
+        if ($expectedPriceCents !== null && $expectedPriceCents !== $saleCents) {
             plugin_station_json([
                 'success' => false,
                 'code' => 409,
                 'message' => '价格已更新，当前订单需按最新价格重新确认',
-                'price_cents' => $priceCents,
+                'price_cents' => $saleCents,
                 'data' => [
-                    'price_cents' => $priceCents,
+                    'price_cents' => $saleCents,
+                    'host_price_cents' => $saleCents,
                 ],
             ], 409);
         }
-        $chargeResult = plugin_station_apply_host_user_charge($currentUser, $priceCents, $sourceOrderId);
+        $chargeResult = plugin_station_apply_host_user_charge($currentUser, $chargeCents, $sourceOrderId);
         if (!($chargeResult['success'] ?? false)) {
             plugin_station_json($chargeResult, 400);
         }
@@ -463,25 +521,26 @@ switch ($action) {
         ]);
 
         if (!($result['success'] ?? false)) {
-            plugin_station_release_host_user_charge($currentUser, $priceCents, $sourceOrderId, '网关创建订单失败');
+            plugin_station_release_host_user_charge($currentUser, $chargeCents, $sourceOrderId, '网关创建订单失败');
             plugin_station_json($result, 400);
         }
 
         $gatewayData = is_array($result['data'] ?? null) ? $result['data'] : [];
         $traceId = (string)($gatewayData['trace_id'] ?? $result['trace_id'] ?? '');
         if ($traceId === '') {
-            plugin_station_release_host_user_charge($currentUser, $priceCents, $sourceOrderId, '网关未返回 trace_id');
             plugin_station_json([
                 'success' => false,
                 'code' => 500,
-                'message' => '插件网关未返回 trace_id',
+                'message' => '上游已接单但未返回 trace_id，勿重复下单，请联系管理员',
+                'source_order_id' => $sourceOrderId,
+                'data' => array_merge($pricing, ['accepted' => true, 'source_order_id' => $sourceOrderId]),
             ], 500);
         }
 
         $remoteStatus = (string)($gatewayData['order_status'] ?? $gatewayData['bridge_status']['data']['order_status'] ?? 'pending_delivery');
         $remoteMessage = (string)($gatewayData['message'] ?? $result['message'] ?? '提交成功，待送达主站');
 
-        plugin_station_save_order([
+        $localOrder = array_merge($pricing, [
             'trace_id' => $traceId,
             'site_id' => $config['site_id'],
             'source_order_id' => $sourceOrderId,
@@ -494,24 +553,38 @@ switch ($action) {
             'school_name' => $payload['school_name'] ?? '',
             'platform' => $payload['platform'] ?? '',
             'target_km' => (float) ($payload['target_km'] ?? 0),
-            'price_cents' => (int)($gatewayData['price_cents'] ?? $result['price_cents'] ?? $priceCents),
+            'price_cents' => $priceCents,
             'status' => $remoteStatus,
             'status_message' => $remoteMessage,
             'host_charge_amount' => (float)($chargeResult['amount'] ?? 0),
             'host_charge_applied' => 1,
         ]);
+        try {
+            plugin_station_save_order($localOrder);
+        } catch (Throwable $e) {
+            plugin_station_json([
+                'success' => false,
+                'code' => 500,
+                'message' => '上游已接单、本地保存失败，勿重复下单，请联系管理员',
+                'trace_id' => $traceId,
+                'data' => array_merge($pricing, ['accepted' => true, 'trace_id' => $traceId]),
+            ], 500);
+        }
 
         plugin_station_json([
             'success' => true,
             'message' => $remoteMessage,
             'trace_id' => $traceId,
-            'price_cents' => (int)($gatewayData['price_cents'] ?? $result['price_cents'] ?? $priceCents),
+            'price_cents' => $priceCents,
+            'host_price_cents' => $saleCents,
+            'host_charge_cents' => $chargeCents,
+            'host_discount_cents' => $pricing['host_discount_cents'],
             'next_poll_after_ms' => (int)($gatewayData['next_poll_after_ms'] ?? $result['next_poll_after_ms'] ?? 1200),
-            'data' => [
+            'data' => array_merge($pricing, [
                 'accepted' => true,
                 'order_status' => $remoteStatus,
                 'bridge_status' => $gatewayData['bridge_status'] ?? null,
-            ],
+            ]),
         ]);
         break;
 
